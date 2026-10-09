@@ -13,9 +13,11 @@ use Talaria\Context\RuntimeContext;
 use Talaria\Exception\TransportException;
 use Talaria\Flags\Flags;
 use Talaria\Integration\ErrorIntegration;
+use Talaria\Monitor\MonitorCheckIn;
 use Talaria\Integration\UncaughtExceptionDump;
 use Talaria\Protocol\ExceptionPayloadBuilder;
 use Talaria\Tracing\BreadcrumbBuffer;
+use Talaria\Tracing\ModelCallContext;
 use Talaria\Tracing\NullSpanTransport;
 use Talaria\Tracing\Span;
 use Talaria\Tracing\SpanKind;
@@ -520,6 +522,19 @@ final class TalariaClient
             $this->globalExtra,
             is_array($context['extra'] ?? null) ? $context['extra'] : [],
         );
+        $stamp = ModelCallContext::read($exception);
+        if ($stamp !== null) {
+            $tags = is_array($context['tags'] ?? null) ? $context['tags'] : [];
+            if (isset($stamp['model']) && is_string($stamp['model']) && $stamp['model'] !== '') {
+                $tags['gen_ai.request.model'] = $stamp['model'];
+            }
+            $tags['gen_ai.operation.name'] = $stamp['operation'];
+            $tags['gen_ai.provider.name'] = $stamp['provider'];
+            $context['tags'] = $tags;
+            if (isset($stamp['statusCode'])) {
+                $extra['status_code'] = $stamp['statusCode'];
+            }
+        }
 
         $defaultTitle = ExceptionPayloadBuilder::shortName($exception);
 
@@ -869,6 +884,34 @@ final class TalariaClient
     }
 
     /**
+     * Post a job check-in immediately. The event queue is not used.
+     *
+     * @param array{
+     *   crontab?: string,
+     *   timezone?: string,
+     *   intervalSeconds?: int,
+     *   marginSeconds?: int,
+     *   maxRuntimeSeconds?: int,
+     *   durationSeconds?: float,
+     *   logTail?: string,
+     *   resource?: array<string, string>
+     * } $schedule
+     * @return array<string, mixed>
+     */
+    public function checkIn(string $slug, string $status, array $schedule = []): array
+    {
+        if ($this->httpTransport === null) {
+            throw new \RuntimeException('Talaria check-in requires the HTTP transport.');
+        }
+
+        return $this->httpTransport->postJson(
+            'monitors/checkIn',
+            MonitorCheckIn::payload($slug, $status, $schedule),
+            max(2.0, $this->config->httpTimeoutSeconds),
+        );
+    }
+
+    /**
      * Clear per-request state on long-lived workers (Octane, Horizon, queue).
      *
      * Does not re-enable a process-level ingest kill switch, and does not
@@ -1150,6 +1193,7 @@ final class TalariaClient
             stackTrace: $stackTrace,
             release: $this->config->release,
             commitSha: $this->config->commitSha,
+            releaseRefKind: $this->config->releaseRefKind,
             userId: $userId,
             sessionId: $this->identity->sessionId,
             requestId: $runtime['requestId'],
